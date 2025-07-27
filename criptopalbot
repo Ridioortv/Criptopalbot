@@ -1,0 +1,199 @@
+import pickle
+import threading
+import time
+from datetime import datetime
+import requests
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    CallbackQueryHandler,
+    CallbackContext,
+    Application,
+    MessageHandler,
+    filters
+)
+
+# Configuración inicial
+TOKEN = "TU_TOKEN_DE_TELEGRAM"  # ¡Reemplaza con tu token real!
+ARCHIVO_DATOS = "criptopal_bot_data.pickle"
+CRIPTOS = ["BTC", "ETH", "BNB", "ADA", "XRP", "SOL", "DOT", "DOGE", "AVAX", "LUNA"]
+
+# Estructura de datos persistente
+datos_bot = {
+    'precios': {},
+    'alertas': {},
+    'usuarios': {}
+}
+
+# Cargar datos existentes
+try:
+    with open(ARCHIVO_DATOS, 'rb') as f:
+        datos_bot = pickle.load(f)
+        print("✅ Datos cargados correctamente desde:", ARCHIVO_DATOS)
+except:
+    print("⚠️ No se encontraron datos previos. Iniciando nuevo archivo.")
+
+# Función para guardar datos
+def guardar_datos():
+    with open(ARCHIVO_DATOS, 'wb') as f:
+        pickle.dump(datos_bot, f)
+    print("💾 Datos guardados:", datetime.now().strftime("%H:%M:%S"))
+
+# Obtener precios de criptomonedas
+def obtener_precios():
+    precios_actuales = {}
+    for cripto in CRIPTOS:
+        try:
+            response = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={cripto}USDT")
+            data = response.json()
+            precios_actuales[cripto] = float(data['price'])
+        except Exception as e:
+            print(f"⚠️ Error obteniendo precio de {cripto}: {str(e)}")
+    return precios_actuales
+
+# Actualizar precios periódicamente
+def actualizar_precios(context: CallbackContext):
+    datos_bot['precios'] = obtener_precios()
+    guardar_datos()
+    print(f"📊 Precios actualizados: {len(datos_bot['precios'])} criptos - {datetime.now().strftime('%H:%M:%S')}")
+
+# Comprobar alertas
+def comprobar_alertas(context: CallbackContext):
+    for user_id, alertas_usuario in list(datos_bot['alertas'].items()):
+        for cripto, alertas in list(alertas_usuario.items()):
+            for alerta in list(alertas):
+                precio_actual = datos_bot['precios'].get(cripto)
+                if precio_actual:
+                    if (alerta['tipo'] == 'above' and precio_actual >= alerta['precio']) or \
+                       (alerta['tipo'] == 'below' and precio_actual <= alerta['precio']):
+                        try:
+                            context.bot.send_message(
+                                chat_id=user_id,
+                                text=f"🚨 ALERTA: {cripto} ha alcanzado ${precio_actual:.4f} (Objetivo: ${alerta['precio']})"
+                            )
+                            alertas.remove(alerta)
+                        except Exception as e:
+                            print(f"Error enviando alerta: {e}")
+    guardar_datos()
+
+# Comandos del bot
+def start(update: Update, context: CallbackContext):
+    user = update.effective_user
+    update.message.reply_markdown_v2(
+        f"👋 ¡Hola {user.mention_markdown_v2()}\! Bienvenido al *Bot Premium de Criptomonedas*\.\n\n"
+        "📌 *Comandos disponibles:*\n"
+        "/precios - Ver precios actuales\n"
+        "/alertas - Administrar alertas\n"
+        "/crearalerta - Crear nueva alerta"
+    )
+
+def mostrar_precios(update: Update, context: CallbackContext):
+    if not datos_bot['precios']:
+        update.message.reply_text("🔄 Obteniendo precios... Por favor intenta en 1 minuto.")
+        return
+    
+    mensaje = "📈 *Precios Actuales:*\n\n"
+    for cripto, precio in datos_bot['precios'].items():
+        mensaje += f"• {cripto}: ${precio:.4f}\n"
+    
+    update.message.reply_markdown(mensaje)
+
+def crear_alerta(update: Update, context: CallbackContext):
+    keyboard = []
+    for i in range(0, len(CRIPTOS), 3):
+        row = []
+        for j in range(3):
+            if i + j < len(CRIPTOS):
+                row.append(InlineKeyboardButton(CRIPTOS[i+j], callback_data=f"alert_create_{CRIPTOS[i+j]}"))
+        keyboard.append(row)
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text("Selecciona una criptomoneda:", reply_markup=reply_markup)
+
+def handle_crear_alerta(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    
+    cripto = query.data.split('_')[-1]
+    context.user_data['cripto_alerta'] = cripto
+    query.edit_message_text(
+        text=f"🔔 Creando alerta para {cripto}:\n\n"
+             "Envía el precio objetivo en formato:\n"
+             "`<precio>` o `> <precio>` o `< <precio>`\n\n"
+             "*Ejemplos:*\n"
+             "`350` - Alerta a $350\n"
+             "`> 400` - Alerta cuando supere $400\n"
+             "`< 300` - Alerta cuando baje de $300"
+    )
+
+def guardar_alerta(update: Update, context: CallbackContext):
+    cripto = context.user_data.get('cripto_alerta')
+    if not cripto:
+        update.message.reply_text("⚠️ Error: Por favor comienza con /crearalerta")
+        return
+    
+    try:
+        texto = update.message.text.strip()
+        tipo = "above" if texto.startswith('>') else "below" if texto.startswith('<') else "exact"
+        precio = float(texto.replace('>', '').replace('<', '').strip())
+        
+        user_id = update.effective_user.id
+        
+        # Inicializar estructura si es necesario
+        if user_id not in datos_bot['alertas']:
+            datos_bot['alertas'][user_id] = {}
+        if cripto not in datos_bot['alertas'][user_id]:
+            datos_bot['alertas'][user_id][cripto] = []
+        
+        # Añadir alerta
+        datos_bot['alertas'][user_id][cripto].append({
+            'precio': precio,
+            'tipo': tipo,
+            'timestamp': datetime.now().timestamp()
+        })
+        
+        guardar_datos()
+        update.message.reply_text(f"✅ Alerta creada para {cripto} a ${precio:.4f}")
+        
+    except ValueError:
+        update.message.reply_text("⚠️ Formato incorrecto. Usa: `<precio>`, `> <precio>` o `< <precio>`")
+
+# Función principal
+def main():
+    print("\n" + "="*60)
+    print("🚀 Bot Premium de Criptomonedas iniciado correctamente!")
+    print("="*60)
+    print(f"✅ Persistencia de datos ACTIVADA. Los datos se guardarán en '{ARCHIVO_DATOS}'")
+    print("🔄 Actualizando precios cada 60 segundos...")
+    print("🚨 Monitoreando alertas cada 30 segundos...")
+
+    # Inicializar precios
+    datos_bot['precios'] = obtener_precios()
+    guardar_datos()
+
+    # Configurar el bot con la nueva API
+    application = Application.builder().token(TOKEN).build()
+
+    # Manejadores de comandos
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("precios", mostrar_precios))
+    application.add_handler(CommandHandler("alertas", crear_alerta))
+    application.add_handler(CommandHandler("crearalerta", crear_alerta))
+    
+    # Manejadores de callbacks
+    application.add_handler(CallbackQueryHandler(handle_crear_alerta, pattern="^alert_create_"))
+    
+    # Manejador de mensajes para alertas
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, guardar_alerta))
+
+    # Tareas programadas
+    application.job_queue.run_repeating(actualizar_precios, interval=60, first=10)
+    application.job_queue.run_repeating(comprobar_alertas, interval=30, first=15)
+
+    # Iniciar bot
+    print("🤖 Bot en línea. Presiona Ctrl+C para detenerlo.")
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
